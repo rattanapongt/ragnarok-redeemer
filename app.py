@@ -19,7 +19,6 @@ SUBMIT_URL  = "https://party.xd.com/event/2021feba/ajax_submit"
 
 ocr = ddddocr.DdddOcr(show_ad=False)
 
-# job storage (in-memory)
 jobs = {}
 
 
@@ -31,17 +30,24 @@ def get_captcha():
     return text, str(captcha_id)
 
 
-def redeem_one(server_id, player_id, code):
-    captcha, captcha_id = get_captcha()
-    data = {
-        "server_id": server_id,
-        "playerid": player_id,
-        "code": code,
-        "captcha": captcha,
-        "captcha_identifier": captcha_id,
-    }
-    res = SESSION.post(SUBMIT_URL, data=data, timeout=10)
-    return res.json(), captcha
+def redeem_one(server_id, player_id, code, max_retry=5):
+    for attempt in range(1, max_retry + 1):
+        captcha, captcha_id = get_captcha()
+        data = {
+            "server_id": server_id,
+            "playerid": player_id,
+            "code": code,
+            "captcha": captcha,
+            "captcha_identifier": captcha_id,
+        }
+        res = SESSION.post(SUBMIT_URL, data=data, timeout=10)
+        result = res.json()
+        raw = str(result).lower()
+        if any(x in raw for x in ["verification", "captcha", "wrong"]):
+            time.sleep(1)
+            continue
+        return result, captcha, attempt
+    return result, captcha, max_retry
 
 
 def run_job(job_id, server_id, player_ids, codes, delay):
@@ -55,7 +61,7 @@ def run_job(job_id, server_id, player_ids, codes, delay):
             break
 
         try:
-            result, captcha = redeem_one(server_id, pid, code)
+            result, captcha, attempts = redeem_one(server_id, pid, code)
             msg = result.get("msg") or result.get("message") or str(result)
             raw = str(result).lower()
 
@@ -66,12 +72,14 @@ def run_job(job_id, server_id, player_ids, codes, delay):
                 status = "skip"
             elif any(x in raw for x in ["verification", "captcha", "wrong"]):
                 status = "captcha"
+                msg = f"captcha ผิดครบ {attempts} ครั้ง | {msg}"
             else:
                 status = "fail"
 
         except Exception as e:
             msg = str(e)
             captcha = "-"
+            attempts = 0
             status = "error"
 
         job["logs"].append({
@@ -79,6 +87,7 @@ def run_job(job_id, server_id, player_ids, codes, delay):
             "pid": pid,
             "code": code,
             "captcha": captcha,
+            "attempts": attempts,
             "status": status,
             "msg": msg,
         })
@@ -128,7 +137,7 @@ def status(job_id):
         "total": job["total"],
         "done": job["done"],
         "success": job["success"],
-        "logs": job["logs"][-50:],  # ส่งแค่ 50 บรรทัดล่าสุด
+        "logs": job["logs"][-50:],
     })
 
 
@@ -147,4 +156,6 @@ def serve(path):
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8080)
+    import os
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)
