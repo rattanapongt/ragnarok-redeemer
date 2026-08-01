@@ -61,6 +61,7 @@
   .code-row.pending .mark, .code-row.pending .code { color: #475569; }
   .code-row .note { font-size: 11px; color: #64748b; }
   @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .3; } }
+  #wait-banner { max-width: 900px; margin: 0 auto 16px; background: #2a2410; border: 1px solid #f8b400; color: #facc15; border-radius: 8px; padding: 10px 14px; font-size: 13px; text-align: center; }
 </style>
 </head>
 <body>
@@ -105,6 +106,8 @@
 
 <div class="progress"><div class="progress-fill" id="progress"></div></div>
 
+<div id="wait-banner" style="display:none;"></div>
+
 <div class="btn-row">
   <button id="btn-start" onclick="startJob()">เริ่มเติม code</button>
   <button id="btn-stop" onclick="stopJob()">หยุด</button>
@@ -127,10 +130,27 @@ let curIds = [];
 let curCodes = [];
 
 function stopPolling() {
-  clearInterval(pollTimer);
+  clearTimeout(pollTimer);
   pollTimer = null;
   document.getElementById('btn-start').disabled = false;
   document.getElementById('btn-stop').style.display = 'none';
+}
+
+function setWaitBanner(msg) {
+  const b = document.getElementById('wait-banner');
+  b.textContent = '⏳ ' + msg;
+  b.style.display = 'block';
+}
+function clearWaitBanner() {
+  document.getElementById('wait-banner').style.display = 'none';
+}
+
+// เจอ 502/503/เน็ตสะดุด → ไม่ยอมแพ้ รอแบบ backoff แล้ว poll ต่อ (ลดถี่ลงเพื่อลดโหลดเซิร์ฟเวอร์)
+function waitAndReschedule(msg) {
+  pollErrors++;
+  const wait = Math.min(3000 + pollErrors * 1500, 15000);
+  setWaitBanner(`${msg} (รออัตโนมัติ ${Math.round(wait / 1000)}s แล้วลองใหม่)`);
+  pollTimer = setTimeout(poll, wait);
 }
 
 function getLines(id) {
@@ -192,7 +212,8 @@ async function startJob() {
   }
   jobId = data.job_id;
   pollErrors = 0;
-  pollTimer = setInterval(poll, 1500);
+  clearWaitBanner();
+  pollTimer = setTimeout(poll, 800);
 }
 
 async function stopJob() {
@@ -206,19 +227,30 @@ async function poll() {
   let res, data;
   try {
     res = await fetch('/api/status/' + jobId);
-    data = await res.json();
   } catch (e) {
-    // network สะดุด — ให้อภัย 3 ครั้งก่อนยอมแพ้ กันยิงรัวไม่หยุด
-    if (++pollErrors >= 3) stopPolling();
-    return;
+    return waitAndReschedule('เชื่อมต่อสะดุด');   // เน็ตสะดุด → รอแล้วลองใหม่
   }
 
-  // job หาย (เช่นเซิร์ฟเวอร์ restart) → หยุด poll ทันที ไม่ยิง 404 รัว
-  if (!res.ok || data.error || !Array.isArray(data.logs)) {
+  if (res.status === 404) {                        // job หายจริง (เซิร์ฟเวอร์ restart)
     stopPolling();
+    setWaitBanner('งานหาย (เซิร์ฟเวอร์อาจ restart) — กด "เริ่มเติม code" ใหม่อีกครั้ง');
     return;
   }
+  if (!res.ok) {                                   // 502/503 = เซิร์ฟเวอร์แน่น → ไม่ยอมแพ้ รอคิว
+    return waitAndReschedule(`เซิร์ฟเวอร์แน่น (${res.status}) กำลังรอคิว`);
+  }
+  try {
+    data = await res.json();
+  } catch (e) {
+    return waitAndReschedule('กำลังรอเซิร์ฟเวอร์');
+  }
+  if (!data || !Array.isArray(data.logs)) {
+    return waitAndReschedule('กำลังรอเซิร์ฟเวอร์');
+  }
+
+  // ได้ข้อมูลปกติ → รีเซ็ตตัวนับ error + ซ่อน banner
   pollErrors = 0;
+  clearWaitBanner();
 
   document.getElementById('s-success').textContent = data.success;
   const pct = data.total ? Math.round((data.done / data.total) * 100) : 0;
@@ -257,7 +289,11 @@ async function poll() {
     log.appendChild(fin);
 
     renderFailSummary(data.failed || []);
+    return;
   }
+
+  // ยังไม่เสร็จ → นัด poll รอบถัดไป
+  pollTimer = setTimeout(poll, 1500);
 }
 
 // การ์ดต่อ Player ID (อัปเดตสด): แต่ละ code = ✓สำเร็จ / ≡ซ้ำ / ✗ไม่ผ่าน / ⏳กำลังเติม / รอคิว

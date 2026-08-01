@@ -13,12 +13,13 @@ CAPTCHA_URL = "https://party.xd.com/captcha/captcha/{}"
 SUBMIT_URL  = "https://party.xd.com/event/2021feba/ajax_submit"
 
 # จำนวนรอบที่จะ retry ทั้งชุด (captcha + submit) เมื่อ "เติม code แล้วไม่เข้า"
-MAX_ROUNDS = 3
+# ตั้งสูงหน่อยเพราะยอมช้าได้ ขอให้พยายามจนกว่าจะผ่าน (server แน่น/captcha ผิด → รอแล้วลองใหม่)
+MAX_ROUNDS = 5
 # หน่วงเวลาระหว่าง request — กำหนดตายตัวฝั่ง server ไม่ให้ user ตั้งเอง (กันยิงถี่จนโดน block)
 FIXED_DELAY = 3
-# จำนวน worker ที่เติมพร้อมกัน (async) — จำกัดไว้ไม่ให้ยิงรัวจนปลายทาง block/เด้ง captcha
-# ตั้งไว้ต่ำเพราะ Render free tier แรม ~512MB, OCR กินแรม รันพร้อมกันเยอะจะโดน OOM (502)
-MAX_WORKERS = 3
+# เติม "ทีละอัน" (sequential) — CPU/แรมบน free tier มีน้อย ถ้าทำพร้อมกันจะแย่ง CPU จน
+# เซิร์ฟเวอร์ตอบ request ไม่ทัน (502/503) ยอมช้าแต่ไม่พัง และรองรับหลายคนได้ดีกว่า
+MAX_WORKERS = 1
 # อายุของ job ก่อนถูกลบทิ้ง (กันหน่วยความจำโตไม่มีวันสิ้นสุด)
 JOB_TTL = 1800  # วินาที
 
@@ -132,9 +133,11 @@ def process_pair(job, server_id, index, code, pid, delay):
 
         if status in ("ok", "skip"):
             break
+        # ไม่เข้า (captcha ผิด / server แน่น / fail) → รอแบบ backoff แล้วลองใหม่จนครบรอบ
         if round_no < MAX_ROUNDS and not job.get("stop"):
-            msg = f"รอบ {round_no}/{MAX_ROUNDS} ไม่เข้า → retry | {msg}"
-            time.sleep(1)
+            wait = min(2 * round_no, 12)  # 2, 4, 6, 8... สูงสุด 12 วิ
+            msg = f"รอบ {round_no}/{MAX_ROUNDS} ไม่เข้า → รอ {wait}s ลองใหม่ | {msg}"
+            time.sleep(wait)
 
     # อัปเดตสถานะงานภายใต้ lock (หลาย worker เขียนพร้อมกัน)
     with state_lock:
