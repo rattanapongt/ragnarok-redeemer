@@ -18,9 +18,9 @@ app = Flask(__name__, static_folder="static")
 CAPTCHA_URL = "https://party.xd.com/captcha/captcha/{}"
 SUBMIT_URL  = "https://party.xd.com/event/2021feba/ajax_submit"
 
-# จำนวนรอบที่จะ retry ทั้งชุด (captcha + submit) เมื่อ "เติม code แล้วไม่เข้า"
-# ตั้งสูงหน่อยเพราะยอมช้าได้ ขอให้พยายามจนกว่าจะผ่าน (server แน่น/captcha ผิด → รอแล้วลองใหม่)
-MAX_ROUNDS = 5
+# จำนวนรอบสูงสุดต่อ 1 คู่ เมื่อ "ไม่เข้า" (timeout / server แน่น / captcha ผิด) → รอแล้วลองใหม่จนครบ
+# หมายเหตุ: ok/skip (สำเร็จ/ซ้ำ) หยุดทันที ไม่นับรอบ retry
+MAX_ROUNDS = 3
 # หน่วงเวลาระหว่าง request — กำหนดตายตัวฝั่ง server ไม่ให้ user ตั้งเอง (กันยิงถี่จนโดน block)
 FIXED_DELAY = 3
 # จำนวนคู่ที่เติมพร้อมกัน — ปรับได้ผ่าน env `MAX_WORKERS` โดยไม่ต้องแก้โค้ด
@@ -105,7 +105,8 @@ def classify(result):
     raw = str(result).lower()
     if any(x in raw for x in ["success", '"code":0', "'code': 0"]):
         return "ok"
-    if any(x in raw for x in ["already", "used", "redeemed"]):
+    # "You have claimed this redemption code" = เคยเติมแล้ว → ซ้ำ ข้ามได้เลย ไม่ต้อง retry
+    if any(x in raw for x in ["already", "used", "redeemed", "claimed"]):
         return "skip"
     if any(x in raw for x in ["verification", "captcha", "wrong"]):
         return "captcha"
