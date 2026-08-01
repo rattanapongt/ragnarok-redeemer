@@ -115,6 +115,10 @@ def process_pair(job, server_id, index, code, pid, delay):
     session = worker_session()
     status, msg, captcha, attempts, round_no = "error", "", "-", 0, 0
 
+    # ทำเครื่องหมายว่า "กำลังเติม" คู่นี้ เพื่อโชว์สถานะสดให้ user เห็นว่ากำลังทำงาน
+    with state_lock:
+        job["active"][index] = {"pid": pid, "code": code}
+
     # retry ทั้งชุดสูงสุด MAX_ROUNDS รอบ ถ้า "เติมแล้วไม่เข้า" (fail/captcha/error)
     for round_no in range(1, MAX_ROUNDS + 1):
         try:
@@ -134,6 +138,7 @@ def process_pair(job, server_id, index, code, pid, delay):
 
     # อัปเดตสถานะงานภายใต้ lock (หลาย worker เขียนพร้อมกัน)
     with state_lock:
+        job["active"].pop(index, None)  # เติมคู่นี้เสร็จแล้ว เอาออกจาก "กำลังเติม"
         bucket = job["by_pid"].setdefault(pid, {"ok": [], "skip": [], "fail": []})
         if status == "ok":
             job["success"] += 1
@@ -205,6 +210,7 @@ def start():
         "logs": [],
         "failed": [],
         "by_pid": {},
+        "active": {},
         "stop": False,
         "finished_at": now,
     }
@@ -236,6 +242,7 @@ def status(job_id):
         "logs": job["logs"][-50:],
         "failed": job["failed"],
         "by_pid": job["by_pid"],
+        "active": list(job["active"].values()),
     })
 
 

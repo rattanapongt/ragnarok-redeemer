@@ -55,6 +55,12 @@
   .code-row.ok   .code { color: #4ade80; }
   .code-row.skip .code { color: #facc15; }
   .code-row.fail .code { color: #f87171; }
+  .code-row.active { background: #1e2a44; border-radius: 4px; }
+  .code-row.active .code { color: #60a5fa; }
+  .code-row.active .mark { animation: pulse 1s ease-in-out infinite; }
+  .code-row.pending .mark, .code-row.pending .code { color: #475569; }
+  .code-row .note { font-size: 11px; color: #64748b; }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .3; } }
 </style>
 </head>
 <body>
@@ -117,6 +123,8 @@ let jobId = null;
 let pollTimer = null;
 let lastLogCount = 0;
 let pollErrors = 0;
+let curIds = [];
+let curCodes = [];
 
 function stopPolling() {
   clearInterval(pollTimer);
@@ -145,6 +153,9 @@ async function startJob() {
   const codes = getLines('codes');
   if (!ids.length || !codes.length) return alert('กรุณาใส่ ID และ Code ก่อน');
 
+  curIds = ids;
+  curCodes = codes;
+
   document.getElementById('btn-start').disabled = true;
   document.getElementById('btn-stop').style.display = 'block';
   document.getElementById('log').innerHTML = '';
@@ -155,6 +166,9 @@ async function startJob() {
   document.getElementById('s-success').textContent = '0';
   document.getElementById('progress').style.width = '0%';
   lastLogCount = 0;
+
+  // วาดการ์ดต่อ Player ID ทันที (ทุก code เริ่มที่สถานะ "รอคิว")
+  renderLiveCards({ by_pid: {}, active: [] });
 
   let res, data;
   try {
@@ -210,6 +224,9 @@ async function poll() {
   const pct = data.total ? Math.round((data.done / data.total) * 100) : 0;
   document.getElementById('progress').style.width = pct + '%';
 
+  // อัปเดตการ์ดต่อ Player ID แบบสด ทุกครั้งที่ poll
+  renderLiveCards(data);
+
   const log = document.getElementById('log');
   const newLogs = data.logs.slice(lastLogCount);
   newLogs.forEach(entry => {
@@ -239,33 +256,59 @@ async function poll() {
     fin.textContent = `เสร็จสิ้น: ${data.success}/${data.done} สำเร็จ`;
     log.appendChild(fin);
 
-    renderPidSummary(data.by_pid || {});
     renderFailSummary(data.failed || []);
   }
 }
 
-// สรุปแยกตาม Player ID: แต่ละ ID เติม code ไหนสำเร็จ / ซ้ำ / ไม่สำเร็จ
-function renderPidSummary(byPid) {
+// การ์ดต่อ Player ID (อัปเดตสด): แต่ละ code = ✓สำเร็จ / ≡ซ้ำ / ✗ไม่ผ่าน / ⏳กำลังเติม / รอคิว
+function renderLiveCards(data) {
   const box = document.getElementById('pid-summary');
-  const pids = Object.keys(byPid);
-  if (!pids.length) { box.style.display = 'none'; box.innerHTML = ''; return; }
+  if (!curIds.length) { box.style.display = 'none'; box.innerHTML = ''; return; }
 
-  const mark = { ok: '✓', skip: '≡', fail: '✗' };
-  const cards = pids.map(pid => {
-    const b = byPid[pid];
-    const rows = [];
-    (b.ok   || []).forEach(c => rows.push(`<div class="code-row ok"><span class="mark">${mark.ok}</span><span class="code">${c}</span></div>`));
-    (b.skip || []).forEach(c => rows.push(`<div class="code-row skip"><span class="mark">${mark.skip}</span><span class="code">${c}</span> <span style="color:#64748b">ซ้ำ</span></div>`));
-    (b.fail || []).forEach(c => rows.push(`<div class="code-row fail"><span class="mark">${mark.fail}</span><span class="code">${c}</span></div>`));
-    const okN = (b.ok || []).length, failN = (b.fail || []).length;
+  const byPid = data.by_pid || {};
+  // เซ็ตของคู่ที่ "กำลังเติม" ตอนนี้ (pid|code)
+  const activeSet = new Set((data.active || []).map(a => a.pid + '|' + a.code));
+
+  const meta = {
+    ok:      { mark: '✓', cls: 'ok',      note: '' },
+    skip:    { mark: '≡', cls: 'skip',    note: 'ซ้ำ' },
+    fail:    { mark: '✗', cls: 'fail',    note: '' },
+    active:  { mark: '⏳', cls: 'active',  note: 'กำลังเติม…' },
+    pending: { mark: '•', cls: 'pending', note: 'รอคิว' },
+  };
+
+  const cards = curIds.map(pid => {
+    const b = byPid[pid] || { ok: [], skip: [], fail: [] };
+    const okSet   = new Set(b.ok   || []);
+    const skipSet = new Set(b.skip || []);
+    const failSet = new Set(b.fail || []);
+
+    const rows = curCodes.map(code => {
+      let st;
+      if (okSet.has(code)) st = 'ok';
+      else if (skipSet.has(code)) st = 'skip';
+      else if (failSet.has(code)) st = 'fail';
+      else if (activeSet.has(pid + '|' + code)) st = 'active';
+      else st = 'pending';
+      const m = meta[st];
+      return `<div class="code-row ${m.cls}"><span class="mark">${m.mark}</span>` +
+             `<span class="code">${code}</span>` +
+             (m.note ? ` <span class="note">${m.note}</span>` : '') + `</div>`;
+    });
+
+    const okN = (b.ok || []).length;
+    const skipN = (b.skip || []).length;
+    const failN = (b.fail || []).length;
+    const doneN = okN + skipN + failN;
     return `<div class="pid-card${failN ? ' has-fail' : ''}">
-      <div class="pid-head"><span>ID ${pid}</span><span class="cnt">สำเร็จ ${okN} / ไม่สำเร็จ ${failN}</span></div>
+      <div class="pid-head"><span>ID ${pid}</span>` +
+      `<span class="cnt">${doneN}/${curCodes.length} · ✓${okN} ✗${failN}</span></div>
       ${rows.join('')}
     </div>`;
   });
 
   box.style.display = 'block';
-  box.innerHTML = `<div class="pid-title">📋 สรุปตาม Player ID</div><div class="pid-grid">${cards.join('')}</div>`;
+  box.innerHTML = `<div class="pid-title">📋 สถานะตาม Player ID</div><div class="pid-grid">${cards.join('')}</div>`;
 }
 
 // สรุป ID + code ที่ "ไม่ผ่าน" (fail / captcha / error) เพื่อเอาไปเติมเองในเกม
