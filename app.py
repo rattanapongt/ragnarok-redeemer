@@ -17,16 +17,14 @@ SUBMIT_URL  = "https://party.xd.com/event/2021feba/ajax_submit"
 MAX_ROUNDS = 5
 # หน่วงเวลาระหว่าง request — กำหนดตายตัวฝั่ง server ไม่ให้ user ตั้งเอง (กันยิงถี่จนโดน block)
 FIXED_DELAY = 3
-# เติม "ทีละอัน" (sequential) — CPU/แรมบน free tier มีน้อย ถ้าทำพร้อมกันจะแย่ง CPU จน
-# เซิร์ฟเวอร์ตอบ request ไม่ทัน (502/503) ยอมช้าแต่ไม่พัง และรองรับหลายคนได้ดีกว่า
-MAX_WORKERS = 1
+# จำนวนคู่ที่เติมพร้อมกัน — เครื่องใหม่แรมเยอะ (7.8GB) รับได้สบาย
+# หมายเหตุ: เพดานจริงคือ rate-limit ของ party.xd.com ไม่ใช่แรมเครื่อง เกิน ~10-15
+# อาจโดนบล็อก/captcha เด้งรัว ถ้าเห็น fail/captcha พุ่งให้ลดลง
+MAX_WORKERS = 10
 # อายุของ job ก่อนถูกลบทิ้ง (กันหน่วยความจำโตไม่มีวันสิ้นสุด)
 JOB_TTL = 1800  # วินาที
 
 ocr = ddddocr.DdddOcr(show_ad=False)
-# OCR กินแรม/CPU — บังคับให้ทำทีละตัว ส่วน network (GET captcha / POST submit) ยัง async
-# ช่วยกันแรมพีคจน OOM บน instance เล็ก โดยยังได้ความเร็วจากงาน I/O ที่ทับซ้อนกัน
-ocr_lock = threading.Lock()
 
 jobs = {}
 jobs_lock = threading.Lock()
@@ -70,8 +68,8 @@ def get_captcha(session):
     captcha_id = random.random()
     r = session.get(CAPTCHA_URL.format(captcha_id), timeout=10)
     r.raise_for_status()
-    with ocr_lock:  # ทำ OCR ทีละตัว กันแรมพีค
-        text = ocr.classification(r.content).strip()
+    # onnxruntime ปลอดภัยกับ multi-thread — ให้ OCR ทำขนานได้ตามจำนวน worker
+    text = ocr.classification(r.content).strip()
     return text, str(captcha_id)
 
 
