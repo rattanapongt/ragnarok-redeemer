@@ -1,3 +1,9 @@
+import os
+# จำกัด OCR ให้ใช้ 1 CPU thread ต่อการเรียก — ต้องตั้งก่อน import onnxruntime/ddddocr
+# กันไม่ให้ worker เยอะๆ ทำ onnxruntime แตก thread จน CPU thrash แย่งกับเว็บอื่นบนเครื่อง
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("ORT_NUM_THREADS", "1")
+
 import random
 import time
 import threading
@@ -17,10 +23,10 @@ SUBMIT_URL  = "https://party.xd.com/event/2021feba/ajax_submit"
 MAX_ROUNDS = 5
 # หน่วงเวลาระหว่าง request — กำหนดตายตัวฝั่ง server ไม่ให้ user ตั้งเอง (กันยิงถี่จนโดน block)
 FIXED_DELAY = 3
-# จำนวนคู่ที่เติมพร้อมกัน — เครื่องใหม่แรมเยอะ (7.8GB) รับได้สบาย
-# หมายเหตุ: เพดานจริงคือ rate-limit ของ party.xd.com ไม่ใช่แรมเครื่อง เกิน ~10-15
-# อาจโดนบล็อก/captcha เด้งรัว ถ้าเห็น fail/captcha พุ่งให้ลดลง
-MAX_WORKERS = 10
+# จำนวนคู่ที่เติมพร้อมกัน — ปรับได้ผ่าน env `MAX_WORKERS` โดยไม่ต้องแก้โค้ด
+# เครื่องแรม 7.8GB รับ 20 ได้สบาย (ใช้ ~1.3GB เหลือให้เว็บอื่น 5GB+)
+# เพดานจริงคือ rate-limit ของ party.xd.com ถ้าเห็น fail/captcha พุ่งให้ลดลง
+MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "20"))
 # อายุของ job ก่อนถูกลบทิ้ง (กันหน่วยความจำโตไม่มีวันสิ้นสุด)
 JOB_TTL = 1800  # วินาที
 
@@ -262,6 +268,5 @@ def serve(path):
 
 
 if __name__ == "__main__":
-    import os
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
