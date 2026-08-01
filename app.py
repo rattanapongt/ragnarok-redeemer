@@ -17,11 +17,15 @@ MAX_ROUNDS = 3
 # หน่วงเวลาระหว่าง request — กำหนดตายตัวฝั่ง server ไม่ให้ user ตั้งเอง (กันยิงถี่จนโดน block)
 FIXED_DELAY = 3
 # จำนวน worker ที่เติมพร้อมกัน (async) — จำกัดไว้ไม่ให้ยิงรัวจนปลายทาง block/เด้ง captcha
-MAX_WORKERS = 5
+# ตั้งไว้ต่ำเพราะ Render free tier แรม ~512MB, OCR กินแรม รันพร้อมกันเยอะจะโดน OOM (502)
+MAX_WORKERS = 3
 # อายุของ job ก่อนถูกลบทิ้ง (กันหน่วยความจำโตไม่มีวันสิ้นสุด)
 JOB_TTL = 1800  # วินาที
 
 ocr = ddddocr.DdddOcr(show_ad=False)
+# OCR กินแรม/CPU — บังคับให้ทำทีละตัว ส่วน network (GET captcha / POST submit) ยัง async
+# ช่วยกันแรมพีคจน OOM บน instance เล็ก โดยยังได้ความเร็วจากงาน I/O ที่ทับซ้อนกัน
+ocr_lock = threading.Lock()
 
 jobs = {}
 jobs_lock = threading.Lock()
@@ -65,7 +69,8 @@ def get_captcha(session):
     captcha_id = random.random()
     r = session.get(CAPTCHA_URL.format(captcha_id), timeout=10)
     r.raise_for_status()
-    text = ocr.classification(r.content).strip()
+    with ocr_lock:  # ทำ OCR ทีละตัว กันแรมพีค
+        text = ocr.classification(r.content).strip()
     return text, str(captcha_id)
 
 

@@ -156,19 +156,25 @@ async function startJob() {
   document.getElementById('progress').style.width = '0%';
   lastLogCount = 0;
 
-  const res = await fetch('/api/start', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      server_id: document.getElementById('server').value,
-      player_ids: ids,
-      codes: codes,
-    })
-  });
-  const data = await res.json();
-  if (!res.ok || !data.job_id) {
+  let res, data;
+  try {
+    res = await fetch('/api/start', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        server_id: document.getElementById('server').value,
+        player_ids: ids,
+        codes: codes,
+      })
+    });
+    data = await res.json();          // 502/หน้า error ส่ง body ว่าง → กันไม่ให้ crash
+  } catch (e) {
     stopPolling();
-    return alert(data.error || 'เริ่มงานไม่สำเร็จ');
+    return alert('เชื่อมต่อเซิร์ฟเวอร์ไม่ได้ (เซิร์ฟเวอร์อาจกำลังตื่นหรือล่ม)\nรอสัก 30–60 วิ แล้วลองใหม่');
+  }
+  if (!res.ok || !data || !data.job_id) {
+    stopPolling();
+    return alert((data && data.error) || `เริ่มงานไม่สำเร็จ (HTTP ${res.status})`);
   }
   jobId = data.job_id;
   pollErrors = 0;
