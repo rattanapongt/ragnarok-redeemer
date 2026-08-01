@@ -2,37 +2,78 @@ import random
 import time
 import threading
 import uuid
+import concurrent.futures
 from flask import Flask, request, jsonify, send_from_directory
 import requests
 import ddddocr
 
 app = Flask(__name__, static_folder="static")
 
-SESSION = requests.Session()
-SESSION.headers.update({
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-    "Referer": "https://party.xd.com/event/2021feba",
-})
-
 CAPTCHA_URL = "https://party.xd.com/captcha/captcha/{}"
 SUBMIT_URL  = "https://party.xd.com/event/2021feba/ajax_submit"
+
+# จำนวนรอบที่จะ retry ทั้งชุด (captcha + submit) เมื่อ "เติม code แล้วไม่เข้า"
+MAX_ROUNDS = 3
+# หน่วงเวลาระหว่าง request — กำหนดตายตัวฝั่ง server ไม่ให้ user ตั้งเอง (กันยิงถี่จนโดน block)
+FIXED_DELAY = 3
+# จำนวน worker ที่เติมพร้อมกัน (async) — จำกัดไว้ไม่ให้ยิงรัวจนปลายทาง block/เด้ง captcha
+MAX_WORKERS = 5
+# อายุของ job ก่อนถูกลบทิ้ง (กันหน่วยความจำโตไม่มีวันสิ้นสุด)
+JOB_TTL = 1800  # วินาที
 
 ocr = ddddocr.DdddOcr(show_ad=False)
 
 jobs = {}
+jobs_lock = threading.Lock()
+# lock แยกสำหรับอัปเดตสถานะภายใน job (นับ done/success, ต่อ list) กัน race ตอนหลาย worker
+state_lock = threading.Lock()
+# session แยกต่อ thread — captcha ผูกกับ session จึงห้ามใช้ session เดียวกันข้าม worker
+_thread_local = threading.local()
 
 
-def get_captcha():
+def worker_session():
+    s = getattr(_thread_local, "session", None)
+    if s is None:
+        s = new_session()
+        _thread_local.session = s
+    return s
+
+
+def new_session():
+    """สร้าง session แยกต่อ 1 job — กัน cookie/captcha ของแต่ละงานทับกัน"""
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Referer": "https://party.xd.com/event/2021feba",
+    })
+    return s
+
+
+def prune_jobs(now):
+    """ลบ job ที่จบแล้วและเก่าเกิน JOB_TTL"""
+    with jobs_lock:
+        stale = [
+            jid for jid, j in jobs.items()
+            if j.get("status") in ("done", "stopped")
+            and now - j.get("finished_at", now) > JOB_TTL
+        ]
+        for jid in stale:
+            jobs.pop(jid, None)
+
+
+def get_captcha(session):
     captcha_id = random.random()
-    r = SESSION.get(CAPTCHA_URL.format(captcha_id), timeout=10)
+    r = session.get(CAPTCHA_URL.format(captcha_id), timeout=10)
     r.raise_for_status()
     text = ocr.classification(r.content).strip()
     return text, str(captcha_id)
 
 
-def redeem_one(server_id, player_id, code, max_retry=5):
+def redeem_one(session, server_id, player_id, code, max_retry=5):
+    """ยิง submit 1 ครั้ง โดย retry เฉพาะกรณี captcha ผิด"""
+    result, captcha = {}, "-"
     for attempt in range(1, max_retry + 1):
-        captcha, captcha_id = get_captcha()
+        captcha, captcha_id = get_captcha(session)
         data = {
             "server_id": server_id,
             "playerid": player_id,
@@ -40,7 +81,7 @@ def redeem_one(server_id, player_id, code, max_retry=5):
             "captcha": captcha,
             "captcha_identifier": captcha_id,
         }
-        res = SESSION.post(SUBMIT_URL, data=data, timeout=10)
+        res = session.post(SUBMIT_URL, data=data, timeout=10)
         result = res.json()
         raw = str(result).lower()
         if any(x in raw for x in ["verification", "captcha", "wrong"]):
@@ -50,59 +91,106 @@ def redeem_one(server_id, player_id, code, max_retry=5):
     return result, captcha, max_retry
 
 
+def classify(result):
+    raw = str(result).lower()
+    if any(x in raw for x in ["success", '"code":0', "'code': 0"]):
+        return "ok"
+    if any(x in raw for x in ["already", "used", "redeemed"]):
+        return "skip"
+    if any(x in raw for x in ["verification", "captcha", "wrong"]):
+        return "captcha"
+    return "fail"
+
+
+def process_pair(job, server_id, index, code, pid, delay):
+    """เติม 1 คู่ (code+pid) พร้อม retry — ทำงานใน worker thread"""
+    if job.get("stop"):
+        return
+
+    session = worker_session()
+    status, msg, captcha, attempts, round_no = "error", "", "-", 0, 0
+
+    # retry ทั้งชุดสูงสุด MAX_ROUNDS รอบ ถ้า "เติมแล้วไม่เข้า" (fail/captcha/error)
+    for round_no in range(1, MAX_ROUNDS + 1):
+        try:
+            result, captcha, attempts = redeem_one(session, server_id, pid, code)
+            msg = result.get("msg") or result.get("message") or str(result)
+            status = classify(result)
+            if status == "captcha":
+                msg = f"captcha ผิดครบ {attempts} ครั้ง | {msg}"
+        except Exception as e:
+            status, msg, captcha, attempts = "error", str(e), "-", 0
+
+        if status in ("ok", "skip"):
+            break
+        if round_no < MAX_ROUNDS and not job.get("stop"):
+            msg = f"รอบ {round_no}/{MAX_ROUNDS} ไม่เข้า → retry | {msg}"
+            time.sleep(1)
+
+    # อัปเดตสถานะงานภายใต้ lock (หลาย worker เขียนพร้อมกัน)
+    with state_lock:
+        bucket = job["by_pid"].setdefault(pid, {"ok": [], "skip": [], "fail": []})
+        if status == "ok":
+            job["success"] += 1
+            bucket["ok"].append(code)
+        elif status == "skip":
+            bucket["skip"].append(code)
+        else:  # fail / captcha / error
+            bucket["fail"].append(code)
+            # เก็บรายการ "ไม่ผ่าน" ครบทุกตัว เพื่อสรุปให้ไปเติมเองในเกม
+            job["failed"].append({"pid": pid, "code": code, "status": status, "msg": msg})
+
+        job["logs"].append({
+            "index": index + 1,
+            "pid": pid,
+            "code": code,
+            "captcha": captcha,
+            "attempts": attempts,
+            "rounds": round_no,
+            "status": status,
+            "msg": msg,
+        })
+        job["done"] += 1
+
+    # หน่วงต่อ worker ให้สุภาพกับปลายทาง (throughput รวม ≈ MAX_WORKERS/FIXED_DELAY)
+    if not job.get("stop"):
+        time.sleep(delay)
+
+
 def run_job(job_id, server_id, player_ids, codes, delay):
     job = jobs[job_id]
     pairs = [(code, pid) for code in codes for pid in player_ids]
     job["total"] = len(pairs)
 
-    for i, (code, pid) in enumerate(pairs):
-        if job.get("stop"):
-            job["status"] = "stopped"
-            break
+    # เติมพร้อมกันแบบ async ด้วย worker pool ที่จำกัดจำนวน
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        futures = [
+            ex.submit(process_pair, job, server_id, i, code, pid, delay)
+            for i, (code, pid) in enumerate(pairs)
+        ]
+        for f in concurrent.futures.as_completed(futures):
+            # เผยแพร่ exception ที่ไม่คาดคิด (ถ้ามี) เพื่อไม่ให้เงียบหาย
+            f.result()
 
-        try:
-            result, captcha, attempts = redeem_one(server_id, pid, code)
-            msg = result.get("msg") or result.get("message") or str(result)
-            raw = str(result).lower()
-
-            if any(x in raw for x in ["success", '"code":0', "'code': 0"]):
-                status = "ok"
-                job["success"] += 1
-            elif any(x in raw for x in ["already", "used", "redeemed"]):
-                status = "skip"
-            elif any(x in raw for x in ["verification", "captcha", "wrong"]):
-                status = "captcha"
-                msg = f"captcha ผิดครบ {attempts} ครั้ง | {msg}"
-            else:
-                status = "fail"
-
-        except Exception as e:
-            msg = str(e)
-            captcha = "-"
-            attempts = 0
-            status = "error"
-
-        job["logs"].append({
-            "index": i + 1,
-            "pid": pid,
-            "code": code,
-            "captcha": captcha,
-            "attempts": attempts,
-            "status": status,
-            "msg": msg,
-        })
-        job["done"] = i + 1
-
-        if i < len(pairs) - 1 and not job.get("stop"):
-            time.sleep(delay)
-
-    if not job.get("stop"):
+    if job.get("stop"):
+        job["status"] = "stopped"
+    else:
         job["status"] = "done"
+    job["finished_at"] = time.time()
 
 
 @app.route("/api/start", methods=["POST"])
 def start():
-    data = request.json
+    data = request.get_json(silent=True) or {}
+    player_ids = data.get("player_ids") or []
+    codes = data.get("codes") or []
+    server_id = data.get("server_id")
+    if not player_ids or not codes or not server_id:
+        return jsonify({"error": "missing server_id / player_ids / codes"}), 400
+
+    now = time.time()
+    prune_jobs(now)
+
     job_id = str(uuid.uuid4())
     jobs[job_id] = {
         "status": "running",
@@ -110,16 +198,19 @@ def start():
         "done": 0,
         "success": 0,
         "logs": [],
+        "failed": [],
+        "by_pid": {},
         "stop": False,
+        "finished_at": now,
     }
     t = threading.Thread(
         target=run_job,
         args=(
             job_id,
-            data["server_id"],
-            data["player_ids"],
-            data["codes"],
-            int(data.get("delay", 3)),
+            server_id,
+            player_ids,
+            codes,
+            FIXED_DELAY,
         ),
         daemon=True,
     )
@@ -138,6 +229,8 @@ def status(job_id):
         "done": job["done"],
         "success": job["success"],
         "logs": job["logs"][-50:],
+        "failed": job["failed"],
+        "by_pid": job["by_pid"],
     })
 
 

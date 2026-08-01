@@ -38,6 +38,23 @@
   .captcha { background: #2a1a3a; color: #c084fc; }
   .error { background: #3a1a1a; color: #f87171; }
   .idle  { color: #64748b; text-align: center; padding: 20px; font-size: 13px; }
+  #fail-summary { max-width: 900px; margin: 16px auto 0; background: #1a1d27; border: 1px solid #e53e3e; border-radius: 12px; padding: 14px; }
+  .fail-head { color: #f87171; font-size: 13px; font-weight: 700; margin-bottom: 10px; }
+  .fail-list { background: #0f1117; border: 1px solid #2d3148; border-radius: 8px; padding: 10px; font-size: 12px; color: #e2e8f0; white-space: pre; overflow-x: auto; max-height: 240px; overflow-y: auto; }
+  .copy-btn { margin-top: 10px; width: 100%; padding: 10px; background: #2d3148; color: #e2e8f0; border: none; border-radius: 8px; font-size: 13px; font-weight: 600; cursor: pointer; }
+  .copy-btn:hover { background: #3a3f5a; }
+  #pid-summary { max-width: 900px; margin: 16px auto 0; }
+  .pid-title { font-size: 13px; color: #94a3b8; margin-bottom: 10px; font-weight: 600; }
+  .pid-grid { display: grid; grid-template-columns: repeat(auto-fill,minmax(260px,1fr)); gap: 12px; }
+  .pid-card { background: #1a1d27; border: 1px solid #2d3148; border-radius: 10px; padding: 12px; }
+  .pid-card.has-fail { border-color: #e53e3e; }
+  .pid-head { display: flex; justify-content: space-between; align-items: center; font-family: monospace; font-size: 13px; color: #f8b400; margin-bottom: 8px; }
+  .pid-head .cnt { font-size: 11px; color: #64748b; }
+  .code-row { display: flex; align-items: center; gap: 6px; font-family: monospace; font-size: 12px; padding: 3px 0; }
+  .code-row .mark { flex-shrink: 0; width: 16px; text-align: center; }
+  .code-row.ok   .code { color: #4ade80; }
+  .code-row.skip .code { color: #facc15; }
+  .code-row.fail .code { color: #f87171; }
 </style>
 </head>
 <body>
@@ -73,8 +90,9 @@
       </select>
     </div>
     <div>
-      <label>Delay ระหว่าง request (วินาที)</label>
-      <input type="number" id="delay" value="3" min="1" max="30">
+      <label>Delay ระหว่าง request</label>
+      <input type="text" value="3 วินาที (กำหนดโดยระบบ)" disabled
+             style="opacity:.6; cursor:not-allowed;">
     </div>
   </div>
 </div>
@@ -90,10 +108,22 @@
   <div class="idle">กรอก IDs และ Codes แล้วกดเริ่ม</div>
 </div>
 
+<div id="pid-summary" style="display:none;"></div>
+
+<div id="fail-summary" style="display:none;"></div>
+
 <script>
 let jobId = null;
 let pollTimer = null;
 let lastLogCount = 0;
+let pollErrors = 0;
+
+function stopPolling() {
+  clearInterval(pollTimer);
+  pollTimer = null;
+  document.getElementById('btn-start').disabled = false;
+  document.getElementById('btn-stop').style.display = 'none';
+}
 
 function getLines(id) {
   return document.getElementById(id).value.split('\n').map(s => s.trim()).filter(Boolean);
@@ -118,6 +148,10 @@ async function startJob() {
   document.getElementById('btn-start').disabled = true;
   document.getElementById('btn-stop').style.display = 'block';
   document.getElementById('log').innerHTML = '';
+  const fs = document.getElementById('fail-summary');
+  fs.style.display = 'none'; fs.innerHTML = '';
+  const ps = document.getElementById('pid-summary');
+  ps.style.display = 'none'; ps.innerHTML = '';
   document.getElementById('s-success').textContent = '0';
   document.getElementById('progress').style.width = '0%';
   lastLogCount = 0;
@@ -129,25 +163,42 @@ async function startJob() {
       server_id: document.getElementById('server').value,
       player_ids: ids,
       codes: codes,
-      delay: parseInt(document.getElementById('delay').value),
     })
   });
   const data = await res.json();
+  if (!res.ok || !data.job_id) {
+    stopPolling();
+    return alert(data.error || 'เริ่มงานไม่สำเร็จ');
+  }
   jobId = data.job_id;
+  pollErrors = 0;
   pollTimer = setInterval(poll, 1500);
 }
 
 async function stopJob() {
   if (jobId) await fetch('/api/stop/' + jobId, { method: 'POST' });
-  clearInterval(pollTimer);
-  document.getElementById('btn-start').disabled = false;
-  document.getElementById('btn-stop').style.display = 'none';
+  stopPolling();
 }
 
 async function poll() {
   if (!jobId) return;
-  const res = await fetch('/api/status/' + jobId);
-  const data = await res.json();
+
+  let res, data;
+  try {
+    res = await fetch('/api/status/' + jobId);
+    data = await res.json();
+  } catch (e) {
+    // network สะดุด — ให้อภัย 3 ครั้งก่อนยอมแพ้ กันยิงรัวไม่หยุด
+    if (++pollErrors >= 3) stopPolling();
+    return;
+  }
+
+  // job หาย (เช่นเซิร์ฟเวอร์ restart) → หยุด poll ทันที ไม่ยิง 404 รัว
+  if (!res.ok || data.error || !Array.isArray(data.logs)) {
+    stopPolling();
+    return;
+  }
+  pollErrors = 0;
 
   document.getElementById('s-success').textContent = data.success;
   const pct = data.total ? Math.round((data.done / data.total) * 100) : 0;
@@ -175,15 +226,66 @@ async function poll() {
   log.scrollTop = log.scrollHeight;
 
   if (data.status === 'done' || data.status === 'stopped') {
-    clearInterval(pollTimer);
-    document.getElementById('btn-start').disabled = false;
-    document.getElementById('btn-stop').style.display = 'none';
+    stopPolling();
 
     const fin = document.createElement('div');
     fin.className = 'idle';
     fin.textContent = `เสร็จสิ้น: ${data.success}/${data.done} สำเร็จ`;
     log.appendChild(fin);
+
+    renderPidSummary(data.by_pid || {});
+    renderFailSummary(data.failed || []);
   }
+}
+
+// สรุปแยกตาม Player ID: แต่ละ ID เติม code ไหนสำเร็จ / ซ้ำ / ไม่สำเร็จ
+function renderPidSummary(byPid) {
+  const box = document.getElementById('pid-summary');
+  const pids = Object.keys(byPid);
+  if (!pids.length) { box.style.display = 'none'; box.innerHTML = ''; return; }
+
+  const mark = { ok: '✓', skip: '≡', fail: '✗' };
+  const cards = pids.map(pid => {
+    const b = byPid[pid];
+    const rows = [];
+    (b.ok   || []).forEach(c => rows.push(`<div class="code-row ok"><span class="mark">${mark.ok}</span><span class="code">${c}</span></div>`));
+    (b.skip || []).forEach(c => rows.push(`<div class="code-row skip"><span class="mark">${mark.skip}</span><span class="code">${c}</span> <span style="color:#64748b">ซ้ำ</span></div>`));
+    (b.fail || []).forEach(c => rows.push(`<div class="code-row fail"><span class="mark">${mark.fail}</span><span class="code">${c}</span></div>`));
+    const okN = (b.ok || []).length, failN = (b.fail || []).length;
+    return `<div class="pid-card${failN ? ' has-fail' : ''}">
+      <div class="pid-head"><span>ID ${pid}</span><span class="cnt">สำเร็จ ${okN} / ไม่สำเร็จ ${failN}</span></div>
+      ${rows.join('')}
+    </div>`;
+  });
+
+  box.style.display = 'block';
+  box.innerHTML = `<div class="pid-title">📋 สรุปตาม Player ID</div><div class="pid-grid">${cards.join('')}</div>`;
+}
+
+// สรุป ID + code ที่ "ไม่ผ่าน" (fail / captcha / error) เพื่อเอาไปเติมเองในเกม
+function renderFailSummary(failed) {
+  const box = document.getElementById('fail-summary');
+
+  if (!failed.length) {
+    box.style.display = 'none';
+    box.innerHTML = '';
+    return;
+  }
+
+  const lines = failed.map(e => `${e.pid}\t${e.code}\t(${e.status})`);
+  const copyText = failed.map(e => `${e.pid}  ${e.code}`).join('\n');
+
+  box.style.display = 'block';
+  box.innerHTML =
+    `<div class="fail-head">⚠ ไม่ผ่าน ${failed.length} รายการ — เอาไปเติมเองในเกม</div>` +
+    `<pre class="fail-list">ID\tCODE\tสถานะ\n${lines.join('\n')}</pre>` +
+    `<button class="copy-btn" id="copy-fail">คัดลอก ID + Code ที่ไม่ผ่าน</button>`;
+
+  document.getElementById('copy-fail').onclick = () => {
+    navigator.clipboard.writeText(copyText).then(() => {
+      document.getElementById('copy-fail').textContent = 'คัดลอกแล้ว ✓';
+    });
+  };
 }
 </script>
 </body>
